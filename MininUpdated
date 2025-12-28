@@ -1,0 +1,1284 @@
+(() => {
+  // ========= utilities =========
+  const values = (obj) => Object.values(obj ?? {});
+  const attempt = (fn, fallback = null) => {
+    try {
+      return fn();
+    } catch {
+      return fallback;
+    }
+  };
+  const clone =
+    typeof structuredClone === "function"
+      ? structuredClone
+      : (obj) => (obj ? JSON.parse(JSON.stringify(obj)) : obj);
+  const style = (el, props) => Object.assign(el.style, props);
+  const el = (tag) => document.createElement(tag);
+  const floor = Math.floor;
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+  const normalizeKey = (e) => (e.key && e.key.length === 1 ? e.key.toUpperCase() : e.code);
+
+  // ========= config =========
+  const config = {
+    killaura: { delay: 120, range: 6.8, jitterRatio: 0.4 },
+    aimbot: { intervalMs: 15, smoothing: 0.12, maxDistance: 8 },
+    autopotions: { interval: 500 },
+    theme: {
+      panelBg: "#0d101a",
+      panelOpacity: 0.96,
+      accent: "#8fb7ff",
+      text: "#e2e8f0",
+    },
+  };
+
+  // Keybinds (default: none / unassigned)
+  const keybinds = {
+    killaura: null,
+    aimbot: null,
+    esp: null,
+    coords: null,
+    autopotions: null,
+  };
+
+  // ========= bloxd / noa bridge =========
+  const B = {
+    wpRequire: null,
+    _noa: null,
+    bloxdProps: null,
+    get noa() {
+      if (!this._noa && this.bloxdProps) {
+        this._noa = values(this.bloxdProps).find((p) => p?.entities);
+      }
+      return this._noa;
+    },
+    clear() {
+      this.wpRequire = null;
+      this._noa = null;
+      this.bloxdProps = null;
+    },
+    init(force = false) {
+      if (this.wpRequire && !force) return;
+      this.clear();
+      const descriptors = Object.getOwnPropertyDescriptors(window);
+      let chunkKey = Object.keys(descriptors).find((key) => {
+        const setter = descriptors[key]?.set;
+        return setter && setter.toString().includes("++");
+      });
+      if (
+        !chunkKey &&
+        !(chunkKey = Object.keys(window).find((key) => {
+          const value = window[key];
+          return Array.isArray(value) && typeof value.push === "function";
+        }))
+      )
+        throw new Error("Unable to locate webpack chunk");
+      const chunk = window[chunkKey];
+      const randomID = Math.floor(Math.random() * 9999999) + 1;
+      chunk.push([[randomID], {}, (req) => (this.wpRequire = req)]);
+      this.bloxdProps = values(this.findModule("nonBlocksClient:")).find((o) => typeof o === "object");
+      this._noa = null;
+    },
+    findModule(str) {
+      if (!this.wpRequire) return null;
+      const mods = this.wpRequire.m;
+      for (const id in mods) {
+        const modFn = mods[id];
+        if (modFn && modFn.toString().includes(str)) return this.wpRequire(id);
+      }
+      return null;
+    },
+  };
+
+  // ========= helpers to read player / blocks =========
+  const getImpKey = () =>
+    attempt(() => {
+      const entities = B.noa.entities;
+      const target = values(entities)[2];
+      return Object.entries(entities).find(([, val]) => val === target)?.[0] ?? null;
+    });
+
+  const game = {
+    getPosition: (id) => attempt(() => B.noa.entities.getState(id, "position").position),
+    getMoveState: (id) => attempt(() => B.noa.entities.getState(id, "movement")),
+    get registry() {
+      return attempt(() => values(B.noa)[17], {});
+    },
+    get getSolidity() {
+      return values(this.registry)[5];
+    },
+    get getBlockID() {
+      return attempt(
+        () => {
+          const names = Object.getOwnPropertyNames(B.noa.bloxd.constructor.prototype);
+          return B.noa.bloxd[names[3]].bind(B.noa.bloxd);
+        },
+        () => 0
+      );
+    },
+    getHeldItemGetter() {
+      return attempt(() =>
+        values(B.noa.entities).find((fn) => {
+          if (typeof fn !== "function" || fn.length !== 1) return false;
+          const body = fn.toString();
+          return body.length < 80 && body.includes(").") && !body.includes("opWrapper");
+        })
+      );
+    },
+    safeHeld(id) {
+      const getter = this.getHeldItemGetter();
+      return getter ? attempt(() => getter(id)) : null;
+    },
+    playerList() {
+      return attempt(() => {
+        const ids = B.noa?.bloxd?.getPlayerIds?.();
+        return ids ? Object.values(ids).map(Number).filter((id) => id && id !== 1 && this.safeHeld(id)) : [];
+      }, []);
+    },
+    get doAttack() {
+      const held = this.safeHeld(1);
+      if (!held) return () => {};
+      const attack = held.doAttack || held.breakingItem?.doAttack;
+      return attack ? attack.bind(held) : () => {};
+    },
+    touchingWall() {
+      const pos = this.getPosition(1);
+      if (!pos) return false;
+      const r = 0.35;
+      const offsets = [
+        [0, 0],
+        [r, 0],
+        [-r, 0],
+        [0, r],
+        [0, -r],
+        [r, r],
+        [r, -r],
+        [-r, r],
+        [-r, -r],
+      ];
+      const heights = [0, 1, 2];
+      const getId = this.getBlockID;
+      for (const [ox, oz] of offsets)
+        for (const h of heights) {
+          const id = attempt(() => getId(floor(pos[0] + ox), floor(pos[1]) + h, floor(pos[2] + oz)), null);
+          if (id !== null && this.getSolidity(id)) return true;
+        }
+      return false;
+    },
+    getHeldItemState() {
+      return getHeldBlockContext()?.playerEntity?.heldItemState || null;
+    },
+    getCamera() {
+      return attempt(() => B.noa.camera, null);
+    },
+  };
+
+  // ========= math =========
+  const math = {
+    norm(v) {
+      const s = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+      if (!s) return v;
+      const i = 1 / Math.sqrt(s);
+      return [v[0] * i, v[1] * i, v[2] * i];
+    },
+    distSq(a, b) {
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const dz = b[2] - a[2];
+      return dx * dx + dy * dy + dz * dz;
+    },
+  };
+
+  // ========= inventory / block helpers =========
+  const getInventoryContext = () => {
+    const noa = B.noa;
+    if (!noa) return null;
+    const entities = noa.entities;
+    const impKey = getImpKey();
+    if (!impKey) return null;
+    const entity = entities[impKey];
+    if (!entity) return null;
+    const inventoryWrapper = values(entity).find((value) => value?.list?.[0]?._blockItem);
+    if (!inventoryWrapper?.list?.length) return null;
+    const listItem = inventoryWrapper.list[0];
+    return { impKey, entity, inventoryWrapper, listItem };
+  };
+
+  const getHeldBlockContext = () => {
+    const ctx = getInventoryContext();
+    if (!ctx) return null;
+    const heldBlock = ctx.listItem?._blockItem;
+    if (!heldBlock) return null;
+    const playerEntity = values(ctx.listItem).find(
+      (value) => typeof value?.checkTargetedBlockCanBePlacedOver === "function"
+    );
+    if (!playerEntity) return null;
+    let worldInstanceKey, worldInstance;
+    if (
+      !Object.keys(heldBlock).some((key) => {
+        const value = heldBlock[key];
+        return value && typeof value === "object"
+          ? ((worldInstanceKey = key), (worldInstance = value), true)
+          : false;
+      })
+    )
+      return null;
+    let targetedBlockKey = null;
+    let targetedBlock = null;
+    Object.keys(worldInstance).some((key) => {
+      const value = worldInstance[key];
+      return value && typeof value === "object" && (value.normal || value.position)
+        ? ((targetedBlockKey = key), (targetedBlock = value), true)
+        : false;
+    });
+    return {
+      heldBlock,
+      worldInstanceKey,
+      worldInstance,
+      targetedBlockKey,
+      targetedBlock,
+      playerEntity,
+    };
+  };
+
+  const createSpoofedContext = (context, position) => {
+    const { heldBlock, worldInstanceKey, worldInstance, targetedBlockKey, targetedBlock } = context;
+    const safeTarget =
+      clone(targetedBlock) || {
+        normal: [0, 1, 0],
+        position: [...position],
+        blockPosition: position.map(floor),
+        hitPoint: [...position],
+      };
+    safeTarget.position = [...position];
+    safeTarget.blockPosition = safeTarget.blockPosition ?? position.map(floor);
+    safeTarget.normal = safeTarget.normal ?? [0, 1, 0];
+    safeTarget.hitPoint = safeTarget.hitPoint ?? [...position];
+    return new Proxy(
+      {},
+      {
+        get(_target, prop) {
+          if (prop === worldInstanceKey)
+            return new Proxy(worldInstance, {
+              get(inner, key) {
+                return key === targetedBlockKey ? safeTarget : inner[key];
+              },
+            });
+          if (prop === "checkTargetedBlockCanBePlacedOver") return () => true;
+          const value = heldBlock[prop];
+          return typeof value === "function" ? value.bind(heldBlock) : value;
+        },
+      }
+    );
+  };
+
+  const placeSpoofedBlock = (position, context) => {
+    const ctx = context ?? getHeldBlockContext();
+    return ctx?.heldBlock?.placeBlock
+      ? attempt(() => {
+          const spoofed = createSpoofedContext(ctx, position);
+          ctx.heldBlock.placeBlock.call(spoofed);
+          return true;
+        }, false)
+      : false;
+  };
+
+  // ========= base module =========
+  class Module {
+    constructor(name) {
+      this.name = name;
+      this.enabled = false;
+    }
+    onEnable() {}
+    onDisable() {}
+    onRender() {}
+    toggle() {
+      this.enabled ? this.disable() : this.enable();
+    }
+    enable() {
+      if (!this.enabled) {
+        this.enabled = true;
+        this.onEnable();
+      }
+    }
+    disable() {
+      if (this.enabled) {
+        this.enabled = false;
+        this.onDisable();
+      }
+    }
+  }
+
+  // ========= Killaura =========
+  class Killaura extends Module {
+    constructor() {
+      super("Killaura");
+      this.lastSwing = 0;
+    }
+    onEnable() {
+      this.lastSwing = 0;
+    }
+    onRender() {
+      const now = Date.now();
+      const baseDelay = config.killaura.delay;
+      const jitter = baseDelay * config.killaura.jitterRatio * (Math.random() - 0.5);
+      const effectiveDelay = Math.max(25, baseDelay + jitter);
+      if (now - this.lastSwing < effectiveDelay) return;
+      this.lastSwing = now;
+      const playerPosition = game.getPosition(1);
+      if (!playerPosition) return;
+      const killRadius = config.killaura.range;
+      const killRadiusSq = killRadius * killRadius;
+      game.playerList().forEach((playerId) => {
+        const enemyPos = game.getPosition(playerId);
+        if (!enemyPos || math.distSq(playerPosition, enemyPos) > killRadiusSq) return;
+        const vector = math.norm([
+          enemyPos[0] - playerPosition[0],
+          enemyPos[1] - playerPosition[1],
+          enemyPos[2] - playerPosition[2],
+        ]);
+        try {
+          game.doAttack(vector, playerId.toString(), "BodyMesh");
+          const safeHeld = game.safeHeld(1);
+          safeHeld?.trySwingBlock && safeHeld.trySwingBlock();
+          const moveState2 = game.getMoveState(1);
+          moveState2?.setArmsAreSwinging && moveState2.setArmsAreSwinging();
+        } catch (error) {
+          console.debug("[KILLAURA] attack failed:", error);
+        }
+      });
+    }
+  }
+  const killaura = new Killaura();
+
+  // ========= Coords List =========
+  class CoordsList extends Module {
+    constructor() {
+      super("CoordsList");
+      this.disabled = true;
+      this.ondisabled = false;
+    }
+    onEnable() {
+      this.disabled = false;
+      this.ondisabled = false;
+    }
+    onDisable() {
+      this.disabled = true;
+      this.ondisabled = false;
+    }
+    onRender() {
+      if (!(this.disabled && this.ondisabled) && B?.noa.bloxd?.entityNames)
+        try {
+          for (const entityId in B.noa.bloxd.entityNames) {
+            if (entityId === "1") continue;
+            const entityData = B.noa.bloxd.entityNames[entityId];
+            const positionData = B.noa.entities?.getState?.(entityId, "position");
+            if (!positionData || !positionData.position) continue;
+            const position = positionData.position;
+            const x = Math.round(position[0]);
+            const y = Math.round(position[1]);
+            const z = Math.round(position[2]);
+            const baseName = entityData.entityName.replace(/\s*\(-?\d+,\s*-?\d+,\s*-?\d+\)$/, "");
+            if (!this.ondisabled && this.disabled) {
+              entityData.entityName = baseName;
+              this.ondisabled = true;
+              continue;
+            }
+            entityData.entityName = `${baseName} (${x}, ${y}, ${z})`;
+          }
+        } catch (error) {
+          console.error("Error updating player coords:", error);
+        }
+    }
+  }
+  const coordsList = new CoordsList();
+
+  // ========= ESP =========
+  class ESP extends Module {
+    constructor() {
+      super("ESP");
+      this.interval = null;
+    }
+    update(state) {
+      if (!B.noa) return;
+      const rendering = values(B.noa)[12];
+      if (!rendering) return;
+      const thinMeshes = values(rendering).find((value) => value?.thinMeshes)?.thinMeshes;
+      if (!Array.isArray(thinMeshes)) return;
+      const renderingGroupId = state ? 2 : 0;
+      for (const item of thinMeshes) {
+        const mesh = item?.meshVariations?.__DEFAULT__?.mesh;
+        if (mesh && typeof mesh.renderingGroupId === "number") mesh.renderingGroupId = renderingGroupId;
+      }
+    }
+    onEnable() {
+      this.update(true);
+      this.interval = setInterval(() => this.update(true), 300);
+    }
+    onDisable() {
+      clearInterval(this.interval);
+      this.interval = null;
+      this.update(false);
+    }
+    onRender() {
+      if (this.enabled) this.update(true);
+    }
+  }
+  const esp = new ESP();
+
+  // ========= Aimbot =========
+  class Aimbot extends Module {
+    constructor() {
+      super("Aimbot");
+      this.interval = null;
+      this.lastAimTime = 0;
+    }
+    angleDiff(e, t) {
+      let n = e - t;
+      while (n > Math.PI) n -= 2 * Math.PI;
+      while (n < -Math.PI) n += 2 * Math.PI;
+      return n;
+    }
+    aimTick() {
+      try {
+        const now = Date.now();
+        if (now - this.lastAimTime < config.aimbot.intervalMs) return;
+        this.lastAimTime = now;
+
+        const playerPos = game.getPosition(1);
+        if (!playerPos) return;
+
+        const cam = game.getCamera();
+        const playerList = game.playerList();
+        if (!cam || !playerList) return;
+
+        let best = { id: null, dist: Infinity, heading: 0, pitch: 0 };
+        for (const pid of playerList) {
+          if (pid === 1) continue;
+          const pos = game.getPosition(pid);
+          if (!pos) continue;
+          const life = attempt(() => B.noa.entities.getState(pid, "genericLifeformState"), null);
+          if (life && life.isAlive === false) continue;
+
+          const dx = pos[0] - playerPos[0];
+          const dy = pos[1] - playerPos[1];
+          const dz = pos[2] - playerPos[2];
+          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+          if (!isFinite(dist) || dist < 1e-3) continue;
+          if (dist > config.aimbot.maxDistance) continue;
+
+          const heading = Math.atan2(dx, dz);
+          const pitch = -Math.asin(dy / dist);
+          if (dist < best.dist) best = { id: pid, dist, heading, pitch };
+        }
+
+        if (!best.id) return;
+        const smoothing = config.aimbot.smoothing || 0.1;
+        const headingDiff = this.angleDiff(best.heading, cam.heading);
+        const pitchDiff = best.pitch - cam.pitch;
+        cam.heading += headingDiff * smoothing;
+        cam.pitch += pitchDiff * smoothing;
+      } catch (e) {
+        console.error("Aimbot tick error:", e);
+        this.onDisable();
+        this.enabled = false;
+      }
+    }
+    onEnable() {
+      if (!this.interval) {
+        this.lastAimTime = 0;
+        this.interval = setInterval(() => this.aimTick(), Math.max(5, config.aimbot.intervalMs));
+      }
+    }
+    onDisable() {
+      if (this.interval) {
+        clearInterval(this.interval);
+        this.interval = null;
+      }
+    }
+  }
+  const aimbot = new Aimbot();
+
+  // ========= Auto Potions =========
+  class AutoPotions extends Module {
+    constructor() {
+      super("Auto Potions");
+      this.interval = null;
+    }
+
+    getInventoryWrapper() {
+      const impKey = getImpKey();
+      return attempt(() => B.noa.entities[impKey]?.inventory?.list?.[0]?.opWrapper ?? null, null);
+    }
+
+    organizePotions() {
+      const inv = this.getInventoryWrapper();
+      if (!inv || !inv.playerInventory?.items) return;
+      const items = inv.playerInventory.items;
+
+      const potionIndices = [];
+      for (let i = 10; i <= 45; i++) {
+        const item = items[i];
+        if (item && item.name && item.name.includes("Instant Healing")) {
+          potionIndices.push(i);
+        }
+      }
+      if (!potionIndices.length) return;
+
+      const emptyHotbarSlots = [];
+      for (let i = 0; i <= 9; i++) {
+        if (!items[i]) emptyHotbarSlots.push(i);
+      }
+      const moves = Math.min(potionIndices.length, emptyHotbarSlots.length);
+      for (let i = 0; i < moves; i++) {
+        inv.swapPosClient(potionIndices[i], emptyHotbarSlots[i], null);
+      }
+    }
+
+    onEnable() {
+      if (this.interval) return;
+      this.organizePotions();
+      this.interval = setInterval(() => this.organizePotions(), config.autopotions.interval);
+    }
+
+    onDisable() {
+      if (this.interval) {
+        clearInterval(this.interval);
+        this.interval = null;
+      }
+    }
+  }
+  const autopotions = new AutoPotions();
+
+  // ========= modules collection =========
+  const modules = [killaura, aimbot, esp, coordsList, autopotions];
+
+  // ========= arraylist (top-left) =========
+  let arraylistNode = null;
+  const ensureArraylistNode = () => {
+    if (arraylistNode) return arraylistNode;
+    arraylistNode = el("div");
+    style(arraylistNode, {
+      position: "fixed",
+      top: "12px",
+      left: "12px",
+      color: "#e2e8f0",
+      font: "14px 'Inter', system-ui, sans-serif",
+      zIndex: 999998,
+      pointerEvents: "none",
+      textShadow: "0 1px 6px rgba(0,0,0,0.45)",
+    });
+    document.body.appendChild(arraylistNode);
+    return arraylistNode;
+  };
+
+  const refreshArraylist = () => {
+    const node = ensureArraylistNode();
+    const active = [];
+    const addEntry = (name, enabled, keyName) => {
+      if (enabled) active.push({ name, key: keybinds[keyName] });
+    };
+    addEntry("Killaura", killaura.enabled, "killaura");
+    addEntry("Aimbot", aimbot.enabled, "aimbot");
+    addEntry("ESP", esp.enabled, "esp");
+    addEntry("Coords", coordsList.enabled, "coords");
+    addEntry("Auto Potions", autopotions.enabled, "autopotions");
+
+    active.sort((a, b) => b.name.length - a.name.length);
+    node.innerHTML = "";
+    active.forEach((item) => {
+      const row = el("div");
+      row.textContent = item.key ? `${item.name} [${item.key}]` : item.name;
+      style(row, {
+        margin: "2px 0",
+        padding: "2px 6px",
+        background: "rgba(15,17,26,0.6)",
+        borderRadius: "6px",
+      });
+      node.appendChild(row);
+    });
+  };
+
+  // ========= module toggle via keybinds =========
+  const toggleByName = (name) => {
+    switch (name) {
+      case "killaura":
+        killaura.toggle();
+        toggleRefs.killaura?.setState?.(killaura.enabled);
+        break;
+      case "aimbot":
+        aimbot.toggle();
+        toggleRefs.aimbot?.setState?.(aimbot.enabled);
+        break;
+      case "esp":
+        esp.toggle();
+        toggleRefs.esp?.setState?.(esp.enabled);
+        break;
+      case "coords":
+        coordsList.toggle();
+        toggleRefs.coords?.setState?.(coordsList.enabled);
+        break;
+      case "autopotions":
+        autopotions.toggle();
+        toggleRefs.autopotions?.setState?.(autopotions.enabled);
+        break;
+    }
+    refreshArraylist();
+  };
+
+  const isTypingInInput = (target) => {
+    const tag = (target?.tagName || "").toUpperCase();
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable;
+  };
+
+  let capturingKeyFor = null;
+
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      if (capturingKeyFor) return;
+      if (isTypingInInput(e.target)) return;
+      if (e.repeat) return;
+      const key = normalizeKey(e);
+      const match = Object.entries(keybinds).find(([, v]) => v && v === key);
+      if (match) {
+        e.preventDefault();
+        toggleByName(match[0]);
+      }
+    },
+    true
+  );
+
+  // ========= draggable helpers =========
+  const makeDraggable = (node, handle) => {
+    let dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+    const start = (e) => {
+      dragging = true;
+      const rect = node.getBoundingClientRect();
+      offsetX = (e.touches?.[0]?.clientX ?? e.clientX) - rect.left;
+      offsetY = (e.touches?.[0]?.clientY ?? e.clientY) - rect.top;
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", end);
+      document.addEventListener("touchmove", move, { passive: false });
+      document.addEventListener("touchend", end);
+    };
+    const move = (e) => {
+      if (!dragging) return;
+      const x = (e.touches?.[0]?.clientX ?? e.clientX) - offsetX;
+      const y = (e.touches?.[0]?.clientY ?? e.clientY) - offsetY;
+      node.style.left = `${x}px`;
+      node.style.top = `${y}px`;
+      node.style.right = "auto";
+    };
+    const end = () => {
+      dragging = false;
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", end);
+      document.removeEventListener("touchmove", move);
+      document.removeEventListener("touchend", end);
+    };
+    handle.addEventListener("mousedown", start);
+    handle.addEventListener("touchstart", start, { passive: false });
+  };
+
+  // ========= resizable helper (right edge) =========
+  const makeResizable = (node, handle) => {
+    let resizing = false;
+    let startX = 0;
+    let startWidth = 0;
+    const minW = 260;
+    const maxW = 520;
+    const start = (e) => {
+      resizing = true;
+      startX = e.touches?.[0]?.clientX ?? e.clientX;
+      startWidth = node.getBoundingClientRect().width;
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", end);
+      document.addEventListener("touchmove", move, { passive: false });
+      document.addEventListener("touchend", end);
+      e.preventDefault();
+    };
+    const move = (e) => {
+      if (!resizing) return;
+      const clientX = e.touches?.[0]?.clientX ?? e.clientX;
+      const delta = clientX - startX;
+      const newW = clamp(startWidth + delta, minW, maxW);
+      node.style.width = `${newW}px`;
+    };
+    const end = () => {
+      resizing = false;
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", end);
+      document.removeEventListener("touchmove", move);
+      document.removeEventListener("touchend", end);
+    };
+    handle.addEventListener("mousedown", start);
+    handle.addEventListener("touchstart", start, { passive: false });
+  };
+
+  // ========= UI helpers =========
+  const toggleRefs = {};
+  let modulesTab, appearanceTab, tabButtons;
+  let currentTab = "modules";
+  let tabSwitching = false;
+
+  const buildRow = (label, control) => {
+    const row = el("div");
+    style(row, {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: "10px",
+      margin: "6px 0",
+      color: config.theme.text,
+      fontSize: "13px",
+      transition: "opacity 0.2s ease, transform 0.2s ease",
+    });
+    const l = el("div");
+    l.textContent = label;
+    l.style.flex = "1";
+    row.appendChild(l);
+    row.appendChild(control);
+    return row;
+  };
+
+  const buildKeybindRow = (keyName, onChange) => {
+    const chip = el("div");
+    const setChipText = () => {
+      chip.textContent = keybinds[keyName] ? `Key${keybinds[keyName]}` : "None";
+    };
+    setChipText();
+    style(chip, {
+      padding: "4px 8px",
+      borderRadius: "6px",
+      background: "rgba(255,255,255,0.08)",
+      color: "#9aa4b5",
+      border: "1px solid rgba(255,255,255,0.12)",
+      fontWeight: "600",
+      fontSize: "12px",
+      display: "inline-block",
+      cursor: "pointer",
+      userSelect: "none",
+      transition: "filter 0.15s ease",
+    });
+    chip.onmouseenter = () => (chip.style.filter = "brightness(1.1)");
+    chip.onmouseleave = () => (chip.style.filter = "brightness(1)");
+    chip.onclick = () => {
+      chip.textContent = "Press key...";
+      capturingKeyFor = keyName;
+      const listener = (e) => {
+        e.preventDefault();
+        if (e.key === "Backspace") {
+          keybinds[keyName] = null;
+        } else {
+          keybinds[keyName] = normalizeKey(e);
+        }
+        capturingKeyFor = null;
+        setChipText();
+        onChange?.();
+        window.removeEventListener("keydown", listener, true);
+      };
+      window.addEventListener("keydown", listener, true);
+    };
+    const row = el("div");
+    style(row, {
+      display: "flex",
+      justifyContent: "flex-start",
+      margin: "4px 0 10px",
+    });
+    row.appendChild(chip);
+    return row;
+  };
+
+  const createToggle = (initial, onChange) => {
+    let state = !!initial;
+    const wrap = el("div");
+    style(wrap, {
+      position: "relative",
+      display: "inline-block",
+      width: "46px",
+      height: "24px",
+      cursor: "pointer",
+      transition: "transform 0.15s ease",
+      userSelect: "none",
+    });
+
+    const track = el("span");
+    style(track, {
+      position: "absolute",
+      inset: "0",
+      background: state ? "#4ade80" : "#2b3142",
+      borderRadius: "24px",
+      transition: "background 0.2s ease",
+    });
+    const thumb = el("span");
+    style(thumb, {
+      position: "absolute",
+      left: "4px",
+      bottom: "4px",
+      width: "16px",
+      height: "16px",
+      background: "#fff",
+      borderRadius: "50%",
+      transition: "transform 0.2s ease",
+      transform: state ? "translateX(22px)" : "translateX(0)",
+    });
+
+    const setState = (v) => {
+      state = !!v;
+      track.style.background = state ? "#4ade80" : "#2b3142";
+      thumb.style.transform = state ? "translateX(22px)" : "translateX(0)";
+    };
+
+    wrap.onclick = () => {
+      setState(!state);
+      onChange(state);
+    };
+
+    wrap.appendChild(track);
+    wrap.appendChild(thumb);
+    return { node: wrap, setState, getState: () => state };
+  };
+
+  const buildSlider = (min, max, step, value, onChange) => {
+    const wrap = el("div");
+    style(wrap, { display: "flex", alignItems: "center", gap: "8px", flex: "1" });
+    const slider = el("input");
+    slider.type = "range";
+    slider.min = min;
+    slider.max = max;
+    slider.step = step;
+    slider.value = value;
+    slider.style.flex = "1";
+    slider.style.transition = "filter 0.15s ease";
+    slider.oninput = (e) => {
+      const v = +e.target.value;
+      label.textContent = v;
+      onChange(v);
+    };
+    slider.onpointerdown = () => (slider.style.filter = "brightness(1.15)");
+    slider.onpointerup = () => (slider.style.filter = "brightness(1)");
+    const label = el("span");
+    label.style.minWidth = "42px";
+    label.style.textAlign = "right";
+    label.textContent = value;
+    wrap.appendChild(slider);
+    wrap.appendChild(label);
+    return wrap;
+  };
+
+  const buildCard = (title, keyName, contentBuilder) => {
+    const details = el("details");
+    details.open = true; // expandable
+    style(details, {
+      background: "#111520",
+      border: "1px solid rgba(255,255,255,0.06)",
+      borderRadius: "10px",
+      padding: "10px 12px",
+      margin: "10px 0",
+      boxShadow: "0 10px 28px rgba(0,0,0,0.28)",
+      transition: "transform 0.18s ease, box-shadow 0.18s ease",
+    });
+    details.onmouseenter = () => {
+      details.style.transform = "translateY(-1px)";
+      details.style.boxShadow = "0 12px 30px rgba(0,0,0,0.32)";
+    };
+    details.onmouseleave = () => {
+      details.style.transform = "translateY(0)";
+      details.style.boxShadow = "0 10px 28px rgba(0,0,0,0.28)";
+    };
+
+    const summary = el("summary");
+    summary.textContent = title;
+    style(summary, {
+      fontWeight: "700",
+      color: "#e5ecf7",
+      marginBottom: "6px",
+      fontSize: "14px",
+      cursor: "default",
+      listStyle: "none",
+      transition: "color 0.15s ease",
+      userSelect: "none",
+    });
+    summary.onclick = (e) => e.preventDefault(); // disable left-click toggle of details
+    summary.oncontextmenu = (e) => {
+      e.preventDefault();
+      details.open = !details.open; // right-click toggles settings open/close
+    };
+    summary.onmouseenter = () => (summary.style.color = "#8fb7ff");
+    summary.onmouseleave = () => (summary.style.color = "#e5ecf7");
+    summary.style.outline = "none";
+    details.appendChild(summary);
+
+    const content = el("div");
+    style(content, { marginTop: "6px", transition: "opacity 0.2s ease" });
+
+    content.appendChild(
+      buildKeybindRow(keyName, () => {
+        refreshArraylist();
+      })
+    );
+    contentBuilder(content);
+    details.appendChild(content);
+    return details;
+  };
+
+  // ========= Tabs with smooth transition =========
+  const switchTab = (target) => {
+    if (target === currentTab || tabSwitching) return;
+    tabSwitching = true;
+    const show = target === "modules" ? modulesTab : appearanceTab;
+    const hide = target === "modules" ? appearanceTab : modulesTab;
+
+    hide.style.opacity = "0";
+    hide.style.transform = "translateY(6px)";
+    setTimeout(() => {
+      hide.style.display = "none";
+      show.style.display = "block";
+      requestAnimationFrame(() => {
+        show.style.opacity = "0";
+        show.style.transform = "translateY(6px)";
+        requestAnimationFrame(() => {
+          show.style.opacity = "1";
+          show.style.transform = "translateY(0)";
+          setTimeout(() => {
+            tabSwitching = false;
+          }, 220);
+        });
+      });
+    }, 180);
+
+    tabButtons.modules.style.color = target === "modules" ? config.theme.accent : "#9aa4b5";
+    tabButtons.appearance.style.color = target === "appearance" ? config.theme.accent : "#9aa4b5";
+    currentTab = target;
+  };
+
+  const applyTheme = () => {
+    if (root) {
+      root.style.background = `linear-gradient(135deg, ${config.theme.panelBg} 0%, rgba(20,24,36,0.9) 100%)`;
+      root.style.opacity = config.theme.panelOpacity;
+      root.style.color = config.theme.text;
+    }
+    refreshArraylist();
+  };
+
+  // ========= UI =========
+  let root = null;
+  let hidden = false;
+
+  const setVisibility = (show) => {
+    hidden = !show;
+    if (!root) return;
+    if (!hidden) {
+      root.style.display = "block";
+      requestAnimationFrame(() => {
+        root.style.opacity = "1";
+        root.style.transform = "translateY(0px) scale(1)";
+      });
+    } else {
+      root.style.opacity = "0";
+      root.style.transform = "translateY(6px) scale(0.99)";
+      setTimeout(() => {
+        if (hidden) root.style.display = "none";
+      }, 180);
+    }
+  };
+
+  const buildUI = () => {
+    root = el("div");
+    style(root, {
+      position: "fixed",
+      top: "14px",
+      left: "14px",
+      width: "360px",
+      background: `linear-gradient(135deg, ${config.theme.panelBg} 0%, rgba(20,24,36,0.9) 100%)`,
+      color: config.theme.text,
+      opacity: config.theme.panelOpacity,
+      font: "14px 'Inter', system-ui, sans-serif",
+      borderRadius: "12px",
+      boxShadow: "0 18px 50px rgba(0,0,0,0.5)",
+      border: "1px solid rgba(255,255,255,0.08)",
+      zIndex: 999999,
+      overflow: "hidden",
+      transform: "translateY(0px) scale(1)",
+      transition: "opacity 0.18s ease, transform 0.18s ease",
+      backdropFilter: "blur(6px)",
+    });
+    document.body.appendChild(root);
+
+    const top = el("div");
+    top.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;background:rgba(15,19,31,0.95);cursor:move;user-select:none;">
+        <div style="font-weight:700;font-size:15px;">Minin <span style="font-weight:600;color:#9aa4b5;">by grad (credits to marcus)</span></div>
+        <div style="display:flex;gap:12px;align-items:center;font-size:13px;color:#9aa4b5;">
+          <span id="btn-modules" style="cursor:pointer;">Modules</span>
+          <span id="btn-appearance" style="cursor:pointer;">Appearance</span>
+          <span id="btn-reinject" style="cursor:pointer;">Re-Inject</span>
+          <span id="btn-hide" style="cursor:pointer;">Hide</span>
+        </div>
+      </div>
+    `;
+    root.appendChild(top);
+
+    modulesTab = el("div");
+    appearanceTab = el("div");
+    style(modulesTab, {
+      padding: "10px 12px",
+      maxHeight: "80vh",
+      overflow: "auto",
+      opacity: "1",
+      transform: "translateY(0)",
+      transition: "opacity 0.22s ease, transform 0.22s ease",
+      display: "block",
+    });
+    style(appearanceTab, {
+      padding: "10px 12px",
+      maxHeight: "80vh",
+      overflow: "auto",
+      opacity: "0",
+      transform: "translateY(6px)",
+      transition: "opacity 0.22s ease, transform 0.22s ease",
+      display: "none",
+    });
+
+    // Modules content
+    const buildModulesContent = () => {
+      const container = modulesTab;
+
+      container.innerHTML = "";
+
+      // Killaura
+      container.appendChild(
+        buildCard("Killaura", "killaura", (card) => {
+          const t = createToggle(killaura.enabled, (on) => {
+            on ? killaura.enable() : killaura.disable();
+            refreshArraylist();
+          });
+          toggleRefs.killaura = t;
+          card.appendChild(buildRow("Enabled (left-click)", t.node));
+          card.appendChild(buildRow("Delay (ms)", buildSlider(25, 400, 1, config.killaura.delay, (v) => (config.killaura.delay = v))));
+          card.appendChild(buildRow("Range", buildSlider(2, 12, 0.1, config.killaura.range, (v) => (config.killaura.range = +v))));
+          card.appendChild(buildRow("Jitter", buildSlider(0, 1, 0.01, config.killaura.jitterRatio, (v) => (config.killaura.jitterRatio = +v))));
+        })
+      );
+
+      // Aimbot
+      container.appendChild(
+        buildCard("Aimbot", "aimbot", (card) => {
+          const t = createToggle(aimbot.enabled, (on) => {
+            on ? aimbot.enable() : aimbot.disable();
+            refreshArraylist();
+          });
+          toggleRefs.aimbot = t;
+          card.appendChild(buildRow("Enabled (left-click)", t.node));
+          card.appendChild(buildRow("Interval (ms)", buildSlider(5, 100, 1, config.aimbot.intervalMs, (v) => (config.aimbot.intervalMs = v))));
+          card.appendChild(buildRow("Smoothing", buildSlider(0.05, 1, 0.01, config.aimbot.smoothing, (v) => (config.aimbot.smoothing = +v))));
+          card.appendChild(buildRow("Max Dist", buildSlider(1, 20, 0.5, config.aimbot.maxDistance, (v) => (config.aimbot.maxDistance = +v))));
+        })
+      );
+
+      // ESP
+      container.appendChild(
+        buildCard("ESP", "esp", (card) => {
+          const t = createToggle(esp.enabled, (on) => {
+            on ? esp.enable() : esp.disable();
+            refreshArraylist();
+          });
+          toggleRefs.esp = t;
+          card.appendChild(buildRow("Enabled (left-click)", t.node));
+        })
+      );
+
+      // CoordsList
+      container.appendChild(
+        buildCard("Coords List", "coords", (card) => {
+          const t = createToggle(coordsList.enabled, (on) => {
+            on ? coordsList.enable() : coordsList.disable();
+            refreshArraylist();
+          });
+          toggleRefs.coords = t;
+          card.appendChild(buildRow("Enabled (left-click)", t.node));
+        })
+      );
+
+      // Auto Potions
+      container.appendChild(
+        buildCard("Auto Potions", "autopotions", (card) => {
+          const t = createToggle(autopotions.enabled, (on) => {
+            on ? autopotions.enable() : autopotions.disable();
+            refreshArraylist();
+          });
+          toggleRefs.autopotions = t;
+          card.appendChild(buildRow("Enabled (left-click)", t.node));
+          card.appendChild(
+            buildRow(
+              "Interval (ms)",
+              buildSlider(200, 1500, 50, config.autopotions.interval, (v) => {
+                config.autopotions.interval = v;
+                if (autopotions.enabled) {
+                  autopotions.disable();
+                  autopotions.enable();
+                }
+              })
+            )
+          );
+        })
+      );
+    };
+
+    // Appearance content
+    const buildAppearanceContent = () => {
+      appearanceTab.innerHTML = "";
+      const section = el("div");
+      style(section, { color: config.theme.text });
+
+      const colorInput = (labelText, value, onInput) => {
+        const wrap = el("div");
+        style(wrap, { display: "flex", alignItems: "center", gap: "8px", margin: "8px 0" });
+        const label = el("div");
+        label.textContent = labelText;
+        label.style.minWidth = "120px";
+        const input = el("input");
+        input.type = "color";
+        input.value = value;
+        input.oninput = (e) => onInput(e.target.value);
+        wrap.appendChild(label);
+        wrap.appendChild(input);
+        return wrap;
+      };
+
+      const sliderInput = (labelText, min, max, step, value, onInput) => {
+        const wrap = el("div");
+        style(wrap, { display: "flex", alignItems: "center", gap: "8px", margin: "8px 0" });
+        const label = el("div");
+        label.textContent = labelText;
+        label.style.minWidth = "120px";
+        const input = el("input");
+        input.type = "range";
+        input.min = min;
+        input.max = max;
+        input.step = step;
+        input.value = value;
+        input.style.flex = "1";
+        const val = el("span");
+        val.textContent = value;
+        input.oninput = (e) => {
+          val.textContent = e.target.value;
+          onInput(+e.target.value);
+        };
+        wrap.appendChild(label);
+        wrap.appendChild(input);
+        wrap.appendChild(val);
+        return wrap;
+      };
+
+      section.appendChild(colorInput("Panel BG", config.theme.panelBg, (v) => { config.theme.panelBg = v; applyTheme(); }));
+      section.appendChild(colorInput("Text Color", config.theme.text, (v) => { config.theme.text = v; applyTheme(); }));
+      section.appendChild(colorInput("Accent Color", config.theme.accent, (v) => { config.theme.accent = v; applyTheme(); }));
+      section.appendChild(sliderInput("Panel Opacity", 0.5, 1, 0.01, config.theme.panelOpacity, (v) => { config.theme.panelOpacity = v; applyTheme(); }));
+
+      appearanceTab.appendChild(section);
+    };
+
+    buildModulesContent();
+    buildAppearanceContent();
+
+    root.appendChild(modulesTab);
+    root.appendChild(appearanceTab);
+
+    const hideBtn = top.querySelector("#btn-hide");
+    const reinjectBtn = top.querySelector("#btn-reinject");
+    const btnModules = top.querySelector("#btn-modules");
+    const btnAppearance = top.querySelector("#btn-appearance");
+    tabButtons = { modules: btnModules, appearance: btnAppearance };
+
+    hideBtn.onclick = () => setVisibility(false);
+    reinjectBtn.onclick = () => {
+      try {
+        B.init(true);
+      } catch (e) {
+        console.warn("Re-inject failed", e);
+      }
+      modules.forEach((m) => m.enabled && m.onDisable?.());
+      modules.forEach((m) => m.enabled && m.onEnable?.());
+    };
+    btnModules.onclick = () => switchTab("modules");
+    btnAppearance.onclick = () => switchTab("appearance");
+
+    // draggable main panel via top bar
+    makeDraggable(root, top.firstElementChild);
+
+    // resizable via right edge
+    const resizer = el("div");
+    style(resizer, {
+      position: "absolute",
+      top: "0",
+      right: "0",
+      width: "8px",
+      height: "100%",
+      cursor: "ew-resize",
+      zIndex: 2,
+      background: "transparent",
+    });
+    root.appendChild(resizer);
+    makeResizable(root, resizer);
+
+    switchTab("modules");
+  };
+
+  // open/close button (floating, draggable)
+  let toggleBtn = null;
+  const buildToggleButton = () => {
+    toggleBtn = el("button");
+    toggleBtn.textContent = "≡";
+    style(toggleBtn, {
+      position: "fixed",
+      top: "14px",
+      left: "14px",
+      width: "32px",
+      height: "32px",
+      cursor: "pointer",
+      zIndex: 1000000,
+      borderRadius: "8px",
+      border: "1px solid rgba(255,255,255,0.2)",
+      background: "rgba(24,27,38,0.9)",
+      color: "#e2e8f0",
+      boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
+      fontWeight: "700",
+      transition: "transform 0.15s ease, box-shadow 0.2s ease",
+    });
+    toggleBtn.onmouseenter = () => {
+      toggleBtn.style.transform = "translateY(-1px)";
+      toggleBtn.style.boxShadow = "0 10px 28px rgba(0,0,0,0.42)";
+    };
+    toggleBtn.onmouseleave = () => {
+      toggleBtn.style.transform = "translateY(0px)";
+      toggleBtn.style.boxShadow = "0 8px 24px rgba(0,0,0,0.35)";
+    };
+    toggleBtn.onclick = () => setVisibility(hidden);
+    document.body.appendChild(toggleBtn);
+    makeDraggable(toggleBtn, toggleBtn);
+  };
+
+  // Right Shift keybind to toggle UI visibility
+  window.addEventListener("keydown", (e) => {
+    if (capturingKeyFor) return;
+    if (e.code === "ShiftRight") {
+      setVisibility(hidden);
+      e.preventDefault();
+    }
+  });
+
+  // ========= bootstrap =========
+  try {
+    B.init();
+  } catch (e) {
+    console.warn("Init failed", e);
+  }
+  buildUI();
+  buildToggleButton();
+  refreshArraylist();
+  startLoop();
+  window.simpleClient = { modules, config, keybinds, toggleUI: () => setVisibility(hidden) };
+})();
